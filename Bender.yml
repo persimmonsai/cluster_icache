@@ -25,6 +25,7 @@ sources:
   - src/snitch_icache_pkg.sv
   - src/riscv_instr_branch.sv
   - src/multi_accept_rr_arb.sv
+  - src/snitch_icache_l0_to_axi.sv
   # Level 1
   - src/snitch_axi_to_cache.sv
   - src/snitch_icache_l0.sv

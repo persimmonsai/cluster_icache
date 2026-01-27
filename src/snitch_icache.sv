@@ -26,15 +26,17 @@ module snitch_icache import snitch_icache_pkg::*; #(
   parameter int unsigned FILL_AW = -1,
   /// Fill interface data width. Power of two; >= 8.
   parameter int unsigned FILL_DW = -1,
+  /// Instruction SPM size in kB. If > 0, bypasses L1 entirely
+  parameter int unsigned InstrSpmSize = 0,
   /// Allow fetches to have priority over prefetches for L0 to L1
   parameter bit FETCH_PRIORITY = 1'b0,
   /// Merge L0-L1 fetches if requesting the same address
   parameter bit MERGE_FETCHES = 1'b0,
-  /// Serialize the L1 lookup (parallel tag/data lookup by default)
+  /// Serialize the L1 lookup (parallel tag/data lookup by default) - UNUSED when InstrSpmSize > 0
   parameter bit SERIAL_LOOKUP = 0,
-  /// Replace the L1 tag banks with latch-based SCM.
+  /// Replace the L1 tag banks with latch-based SCM. - UNUSED when InstrSpmSize > 0
   parameter bit L1_TAG_SCM = 0,
-  /// Number of pending response beats for the L1 cache.
+  /// Number of pending response beats for the L1 cache. - UNUSED when InstrSpmSize > 0
   parameter int unsigned NUM_AXI_OUTSTANDING = 2,
   /// This reduces area impact at the cost of
   /// increased hassle of having latches in
@@ -78,6 +80,7 @@ module snitch_icache import snitch_icache_pkg::*; #(
   input  sram_cfg_data_t  sram_cfg_data_i,
   input  sram_cfg_tag_t   sram_cfg_tag_i,
 
+  // AXI master interface (for L0 prefetchers when InstrSpmSize > 0, or L1 refill otherwise)
   output axi_req_t axi_req_o,
   input  axi_rsp_t axi_rsp_i
 );
@@ -479,6 +482,102 @@ module snitch_icache import snitch_icache_pkg::*; #(
   end
   assign prefetch_lookup_rsp_ready = |prefetch_rsp_ready;
 
+  // ==============================================
+  // L0 Prefetcher Backend: SPM mode vs L1 mode
+  // ==============================================
+
+  if (InstrSpmSize > 0) begin : gen_spm_mode
+    // SPM mode: L0 prefetchers access instruction SPM via AXI (cacheable)
+    // Bypass path still active for non-cacheable bootrom accesses
+    // No L1 cache instantiated
+
+    miss_refill_req_t spm_req;
+    logic spm_req_valid, spm_req_ready;
+
+    // Build SPM request (cacheable path)
+    assign spm_req.addr = prefetch_lookup_req.addr;
+    assign spm_req.id = prefetch_lookup_req.id[CFG.PENDING_IW-1:0];
+    assign spm_req.bypass = 1'b0;
+
+    // Store full ID for response reconstruction
+    logic [CFG.ID_WIDTH-1:0] spm_id_q;
+    logic spm_id_valid;
+    
+    `FF(spm_id_q, prefetch_lookup_req.id, '0)
+    `FF(spm_id_valid, spm_req_valid && spm_req_ready && !spm_req.bypass, 1'b0)
+
+    // Arbitrate between cacheable (SPM) and non-cacheable (bootrom) requests
+    stream_arbiter #(
+      .DATA_T ( miss_refill_req_t ),
+      .N_INP  ( 2                 )
+    ) i_stream_arbiter_spm_bypass (
+      .clk_i,
+      .rst_ni,
+      .inp_data_i  ( {bypass_req_q, spm_req}             ),
+      .inp_valid_i ( {bypass_req_valid_q, spm_req_valid} ),
+      .inp_ready_o ( {bypass_req_ready_q, spm_req_ready} ),
+      .oup_data_o  ( refill_req                          ),
+      .oup_valid_o ( refill_req_valid                    ),
+      .oup_ready_i ( refill_req_ready                    )
+    );
+
+    assign spm_req_valid = prefetch_lookup_req_valid;
+    assign prefetch_lookup_req_ready = spm_req_ready;
+
+    // Use refill module to handle AXI transactions for both paths
+    snitch_icache_refill #(
+      .CFG       ( CFG       ),
+      .axi_req_t ( axi_req_t ),
+      .axi_rsp_t ( axi_rsp_t )
+    ) i_refill (
+      .clk_i,
+      .rst_ni,
+
+      .in_req_addr_i   ( refill_req.addr    ),
+      .in_req_id_i     ( refill_req.id      ),
+      .in_req_bypass_i ( refill_req.bypass  ),
+      .in_req_valid_i  ( refill_req_valid   ),
+      .in_req_ready_o  ( refill_req_ready   ),
+
+      .in_rsp_data_o   ( refill_rsp.data    ),
+      .in_rsp_error_o  ( refill_rsp.error   ),
+      .in_rsp_id_o     ( refill_rsp.id      ),
+      .in_rsp_bypass_o ( refill_rsp.bypass  ),
+      .in_rsp_valid_o  ( refill_rsp_valid   ),
+      .in_rsp_ready_i  ( refill_rsp_ready   ),
+
+      .axi_req_o       ( axi_req_o          ),
+      .axi_rsp_i       ( axi_rsp_i          )
+    );
+
+    // Demux responses back to cacheable (L0) and bypass paths
+    stream_demux #(
+      .N_OUP  ( 2 )
+    ) i_stream_demux_spm_bypass (
+      .inp_valid_i ( refill_rsp_valid  ),
+      .inp_ready_o ( refill_rsp_ready  ),
+
+      .oup_sel_i   ( refill_rsp.bypass ),
+
+      .oup_valid_o ( {bypass_rsp_valid, prefetch_lookup_rsp_valid} ),
+      .oup_ready_i ( {bypass_rsp_ready, prefetch_lookup_rsp_ready} )
+    );
+
+    // Route responses - restore full ID for SPM responses
+    assign prefetch_lookup_rsp.data  = refill_rsp.data;
+    assign prefetch_lookup_rsp.error = refill_rsp.error;
+    assign prefetch_lookup_rsp.id    = spm_id_valid ? spm_id_q : '0;
+    assign bypass_rsp = refill_rsp;
+
+    // Tie off events and flush
+    assign icache_l1_events_o = '0;
+    logic flush_valid;
+    assign flush_valid = |flush_valid_i;
+    assign flush_ready_o = {CFG.NR_FETCH_PORTS{flush_valid}}; // Immediate ack
+
+  end else begin : gen_l1_mode
+    // L1 cache mode: Full lookup, handler, and refill logic
+
   /// Tag lookup
 
   // The lookup module contains the actual cache RAMs and performs lookups.
@@ -702,6 +801,8 @@ module snitch_icache import snitch_icache_pkg::*; #(
     .axi_req_o (axi_req_o),
     .axi_rsp_i (axi_rsp_i)
   );
+
+  end // gen_l1_mode
 
 endmodule
 
