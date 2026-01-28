@@ -80,9 +80,13 @@ module snitch_icache import snitch_icache_pkg::*; #(
   input  sram_cfg_data_t  sram_cfg_data_i,
   input  sram_cfg_tag_t   sram_cfg_tag_i,
 
-  // AXI master interface (for L0 prefetchers when InstrSpmSize > 0, or L1 refill otherwise)
+  // AXI master interface (for bypass access to bootrom when InstrSpmSize > 0, or L1 refill otherwise)
   output axi_req_t axi_req_o,
-  input  axi_rsp_t axi_rsp_i
+  input  axi_rsp_t axi_rsp_i,
+  
+  // AXI slave interface for SPM refill (only used when InstrSpmSize > 0)
+  input  axi_req_t spm_axi_req_i,
+  output axi_rsp_t spm_axi_rsp_o
 );
 
   // Bundle the parameters up into a proper configuration struct that we can
@@ -487,48 +491,286 @@ module snitch_icache import snitch_icache_pkg::*; #(
   // ==============================================
 
   if (InstrSpmSize > 0) begin : gen_spm_mode
-    // SPM mode: L0 prefetchers access instruction SPM via AXI (cacheable)
-    // Bypass path still active for non-cacheable bootrom accesses
-    // No L1 cache instantiated
+    // SPM mode: prefetch_lookup_req (cacheable) goes to SPM
+    // bypass_req_q (non-cacheable) goes to AXI for bootrom
+    // No address decoding needed - inst_cacheable_i already separates them
 
-    miss_refill_req_t spm_req;
-    logic spm_req_valid, spm_req_ready;
-
-    // Build SPM request (cacheable path)
-    assign spm_req.addr = prefetch_lookup_req.addr;
-    assign spm_req.id = prefetch_lookup_req.id[CFG.PENDING_IW-1:0];
-    assign spm_req.bypass = 1'b0;
-
-    // Store full ID for response reconstruction
-    logic [CFG.ID_WIDTH-1:0] spm_id_q;
-    logic spm_id_valid;
+    // Instantiate multi-port instruction SPM
+    localparam int unsigned InstrSpmNumBanks = 2**$clog2(NR_FETCH_PORTS);
     
-    `FF(spm_id_q, prefetch_lookup_req.id, '0)
-    `FF(spm_id_valid, spm_req_valid && spm_req_ready && !spm_req.bypass, 1'b0)
-
-    // Arbitrate between cacheable (SPM) and non-cacheable (bootrom) requests
-    stream_arbiter #(
-      .DATA_T ( miss_refill_req_t ),
-      .N_INP  ( 2                 )
-    ) i_stream_arbiter_spm_bypass (
-      .clk_i,
-      .rst_ni,
-      .inp_data_i  ( {bypass_req_q, spm_req}             ),
-      .inp_valid_i ( {bypass_req_valid_q, spm_req_valid} ),
-      .inp_ready_o ( {bypass_req_ready_q, spm_req_ready} ),
-      .oup_data_o  ( refill_req                          ),
-      .oup_valid_o ( refill_req_valid                    ),
-      .oup_ready_i ( refill_req_ready                    )
+    logic spm_rvalid;
+    
+    snitch_instr_spm #(
+      .AddrWidth (CFG.FETCH_AW),
+      .DataWidth (CFG.FILL_DW),
+      .IdWidth (4), // Refill ID width
+      .SpmSize (InstrSpmSize * 1024),
+      .NumBanks (InstrSpmNumBanks),
+      .NumFetchPorts (1), // Single arbitrated fetch port
+      .axi_req_t (axi_req_t),
+      .axi_rsp_t (axi_rsp_t)
+    ) i_instr_spm (
+      .clk_i (clk_i),
+      .rst_ni (rst_ni),
+      // Arbitrated cacheable requests go to SPM
+      .fetch_req_i (prefetch_lookup_req_valid),
+      .fetch_addr_i (prefetch_lookup_req.addr),
+      .fetch_rdata_o (prefetch_lookup_rsp.data),
+      .fetch_rvalid_o (spm_rvalid),
+      // AXI slave for refill (exposed at icache level)
+      .axi_req_i (spm_axi_req_i),
+      .axi_rsp_o (spm_axi_rsp_o)
     );
+    
+    // SPM response - always ready (single-cycle)
+    assign prefetch_lookup_req_ready = 1'b1;
+    assign prefetch_lookup_rsp_valid = spm_rvalid;
+    assign prefetch_lookup_rsp.error = 1'b0; // SPM never errors
+    assign prefetch_lookup_rsp.id = prefetch_lookup_req.id;
 
-    assign spm_req_valid = prefetch_lookup_req_valid;
-    assign prefetch_lookup_req_ready = spm_req_ready;
-
-    // Use refill module to handle AXI transactions for both paths
+    // Use refill module for bypass (bootrom) accesses via AXI
+    // bypass_req_q comes from l0_to_bypass for non-cacheable requests
     snitch_icache_refill #(
       .CFG       ( CFG       ),
       .axi_req_t ( axi_req_t ),
       .axi_rsp_t ( axi_rsp_t )
+    ) i_refill (
+      .clk_i,
+      .rst_ni,
+
+      .in_req_addr_i   ( bypass_req_q.addr    ),
+      .in_req_id_i     ( bypass_req_q.id      ),
+      .in_req_bypass_i ( bypass_req_q.bypass  ),
+      .in_req_valid_i  ( bypass_req_valid_q   ),
+      .in_req_ready_o  ( bypass_req_ready_q   ),
+
+      .in_rsp_data_o   ( bypass_rsp.data      ),
+      .in_rsp_error_o  ( bypass_rsp.error     ),
+      .in_rsp_id_o     ( bypass_rsp.id        ),
+      .in_rsp_bypass_o ( bypass_rsp.bypass    ),
+      .in_rsp_valid_o  ( bypass_rsp_valid     ),
+      .in_rsp_ready_i  ( bypass_rsp_ready     ),
+
+      .axi_req_o       ( axi_req_o            ),
+      .axi_rsp_i       ( axi_rsp_i            )
+    );
+
+    // Tie off events and flush
+    assign icache_l1_events_o = '0;
+    logic flush_valid;
+    assign flush_valid = |flush_valid_i;
+    assign flush_ready_o = {CFG.NR_FETCH_PORTS{flush_valid}}; // Immediate ack
+
+  end else begin : gen_l1_mode
+    // L1 cache mode: Full lookup, handler, and refill logic
+    
+    // Tie off SPM AXI slave interface (not used in L1 mode)
+    assign spm_axi_rsp_o = '0;
+
+    /// Tag lookup
+
+    // The lookup module contains the actual cache RAMs and performs lookups.
+    logic [CFG.FETCH_AW-1:0]    lookup_addr  ;
+    logic [CFG.ID_WIDTH-1:0]    lookup_id    ;
+    logic [CFG.SET_ALIGN-1:0]   lookup_set   ;
+    logic                       lookup_hit   ;
+    logic [CFG.LINE_WIDTH-1:0]  lookup_data  ;
+    logic                       lookup_error ;
+    logic                       lookup_valid ;
+    logic                       lookup_ready ;
+
+    logic [CFG.COUNT_ALIGN-1:0] write_addr  ;
+    logic [CFG.SET_ALIGN-1:0]   write_set   ;
+    logic [CFG.LINE_WIDTH-1:0]  write_data  ;
+    logic [CFG.TAG_WIDTH-1:0]   write_tag   ;
+    logic                       write_error ;
+    logic                       write_valid ;
+    logic                       write_ready ;
+
+    logic flush_valid, flush_ready;
+    logic flush_valid_lookup, flush_ready_lookup;
+
+    assign flush_ready_o = {CFG.NR_FETCH_PORTS{flush_ready}};
+    assign flush_valid = |flush_valid_i;
+
+    // We need to propagate the handshake into the other
+    // clock domain in case we operate w/ different clocks.
+    if (ISO_CROSSING) begin : gen_flush_crossing
+      isochronous_spill_register
+      i_isochronous_4phase_handshake (
+        .src_clk_i   ( clk_d2_i           ),
+        .src_rst_ni  ( rst_ni             ),
+        .src_valid_i ( flush_valid        ),
+        .src_ready_o ( flush_ready        ),
+        .src_data_i  ( '0                 ),
+        .dst_clk_i   ( clk_i              ),
+        .dst_rst_ni  ( rst_ni             ),
+        .dst_valid_o ( flush_valid_lookup ),
+        .dst_ready_i ( flush_ready_lookup ),
+        .dst_data_o  ( /* Unused */       )
+      );
+    end else begin : gen_no_flush_crossing
+      assign flush_valid_lookup = flush_valid;
+      assign flush_ready = flush_ready_lookup;
+    end
+
+    if (SERIAL_LOOKUP) begin : gen_serial_lookup
+      snitch_icache_lookup_serial #(
+        .CFG             ( CFG             ),
+        .sram_cfg_tag_t  ( sram_cfg_tag_t  ),
+        .sram_cfg_data_t ( sram_cfg_data_t )
+      ) i_lookup (
+        .clk_i,
+        .rst_ni,
+
+        .flush_valid_i   ( flush_valid_lookup        ),
+        .flush_ready_o   ( flush_ready_lookup        ),
+        .icache_events_o ( icache_l1_events_o        ),
+
+        .in_addr_i       ( prefetch_lookup_req.addr  ),
+        .in_id_i         ( prefetch_lookup_req.id    ),
+        .in_valid_i      ( prefetch_lookup_req_valid ),
+        .in_ready_o      ( prefetch_lookup_req_ready ),
+
+        .out_addr_o      ( lookup_addr               ),
+        .out_id_o        ( lookup_id                 ),
+        .out_set_o       ( lookup_set                ),
+        .out_hit_o       ( lookup_hit                ),
+        .out_data_o      ( lookup_data               ),
+        .out_error_o     ( lookup_error              ),
+        .out_valid_o     ( lookup_valid              ),
+        .out_ready_i     ( lookup_ready              ),
+
+        .write_addr_i    ( write_addr                ),
+        .write_set_i     ( write_set                 ),
+        .write_data_i    ( write_data                ),
+        .write_tag_i     ( write_tag                 ),
+        .write_error_i   ( write_error               ),
+        .write_valid_i   ( write_valid               ),
+        .write_ready_o   ( write_ready               ),
+
+        .sram_cfg_tag_i,
+        .sram_cfg_data_i
+      );
+
+    end else begin : gen_parallel_lookup
+      snitch_icache_lookup_parallel #(
+        .CFG             ( CFG             ),
+        .sram_cfg_tag_t  ( sram_cfg_tag_t  ),
+        .sram_cfg_data_t ( sram_cfg_data_t )
+      ) i_lookup (
+        .clk_i,
+        .rst_ni,
+
+        .flush_valid_i   ( flush_valid_lookup        ),
+        .flush_ready_o   ( flush_ready_lookup        ),
+        .icache_events_o ( icache_l1_events_o        ),
+
+        .in_addr_i       ( prefetch_lookup_req.addr  ),
+        .in_id_i         ( prefetch_lookup_req.id    ),
+        .in_valid_i      ( prefetch_lookup_req_valid ),
+        .in_ready_o      ( prefetch_lookup_req_ready ),
+
+        .out_addr_o      ( lookup_addr               ),
+        .out_id_o        ( lookup_id                 ),
+        .out_set_o       ( lookup_set                ),
+        .out_hit_o       ( lookup_hit                ),
+        .out_data_o      ( lookup_data               ),
+        .out_error_o     ( lookup_error              ),
+        .out_valid_o     ( lookup_valid              ),
+        .out_ready_i     ( lookup_ready              ),
+
+        .write_addr_i    ( write_addr                ),
+        .write_set_i     ( write_set                 ),
+        .write_data_i    ( write_data                ),
+        .write_tag_i     ( write_tag                 ),
+        .write_error_i   ( write_error               ),
+        .write_valid_i   ( write_valid               ),
+        .write_ready_o   ( write_ready               ),
+
+        .sram_cfg_tag_i,
+        .sram_cfg_data_i
+      );
+    end
+
+    // The miss handler module deals with the result of the lookup. It also
+    // keeps track of the pending refills and ensures that no redundant memory
+    // requests are made. Upon refill completion, it sends a new tag/data item
+    // to the lookup module and the received data to the prefetch module.
+    snitch_icache_handler #(CFG) i_handler (
+      .clk_i,
+      .rst_ni,
+
+      .in_req_addr_i   ( lookup_addr        ),
+      .in_req_id_i     ( lookup_id          ),
+      .in_req_set_i    ( lookup_set         ),
+      .in_req_hit_i    ( lookup_hit         ),
+      .in_req_data_i   ( lookup_data        ),
+      .in_req_error_i  ( lookup_error       ),
+      .in_req_valid_i  ( lookup_valid       ),
+      .in_req_ready_o  ( lookup_ready       ),
+
+      .in_rsp_data_o   ( prefetch_lookup_rsp.data  ),
+      .in_rsp_error_o  ( prefetch_lookup_rsp.error ),
+      .in_rsp_id_o     ( prefetch_lookup_rsp.id    ),
+      .in_rsp_valid_o  ( prefetch_lookup_rsp_valid ),
+      .in_rsp_ready_i  ( prefetch_lookup_rsp_ready ),
+
+      .write_addr_o    ( write_addr         ),
+      .write_set_o     ( write_set          ),
+      .write_data_o    ( write_data         ),
+      .write_tag_o     ( write_tag          ),
+      .write_error_o   ( write_error        ),
+      .write_valid_o   ( write_valid        ),
+      .write_ready_i   ( write_ready        ),
+
+      .out_req_addr_o  ( handler_req.addr    ),
+      .out_req_id_o    ( handler_req.id      ),
+      .out_req_valid_o ( handler_req_valid   ),
+      .out_req_ready_i ( handler_req_ready   ),
+
+      .out_rsp_data_i  ( handler_rsp.data    ),
+      .out_rsp_error_i ( handler_rsp.error   ),
+      .out_rsp_id_i    ( handler_rsp.id      ),
+      .out_rsp_valid_i ( handler_rsp_valid   ),
+      .out_rsp_ready_o ( handler_rsp_ready   )
+    );
+    assign handler_req.bypass = 1'b0;
+    // Arbitrate between bypass and cache-refills
+    stream_arbiter #(
+      .DATA_T ( miss_refill_req_t ),
+      .N_INP  ( 2                 )
+    ) i_stream_arbiter_miss_refill (
+      .clk_i,
+      .rst_ni,
+      .inp_data_i  ( {bypass_req_q, handler_req}             ),
+      .inp_valid_i ( {bypass_req_valid_q, handler_req_valid} ),
+      .inp_ready_o ( {bypass_req_ready_q, handler_req_ready} ),
+      .oup_data_o  ( refill_req                              ),
+      .oup_valid_o ( refill_req_valid                        ),
+      .oup_ready_i ( refill_req_ready                        )
+    );
+    // Response path muxing
+    stream_demux #(
+      .N_OUP  ( 2                 )
+    ) i_stream_demux_miss_refill (
+      .inp_valid_i ( refill_rsp_valid  ),
+      .inp_ready_o ( refill_rsp_ready  ),
+
+      .oup_sel_i   ( refill_rsp.bypass ),
+
+      .oup_valid_o ( {{bypass_rsp_valid, handler_rsp_valid}} ),
+      .oup_ready_i ( {{bypass_rsp_ready, handler_rsp_ready}} )
+    );
+
+    assign handler_rsp = refill_rsp;
+    assign bypass_rsp = refill_rsp;
+
+    // Instantiate the cache refill module which emits AXI transactions.
+    snitch_icache_refill #(
+      .CFG(CFG),
+      .axi_req_t (axi_req_t),
+      .axi_rsp_t (axi_rsp_t)
     ) i_refill (
       .clk_i,
       .rst_ni,
@@ -545,262 +787,9 @@ module snitch_icache import snitch_icache_pkg::*; #(
       .in_rsp_bypass_o ( refill_rsp.bypass  ),
       .in_rsp_valid_o  ( refill_rsp_valid   ),
       .in_rsp_ready_i  ( refill_rsp_ready   ),
-
-      .axi_req_o       ( axi_req_o          ),
-      .axi_rsp_i       ( axi_rsp_i          )
+      .axi_req_o (axi_req_o),
+      .axi_rsp_i (axi_rsp_i)
     );
-
-    // Demux responses back to cacheable (L0) and bypass paths
-    stream_demux #(
-      .N_OUP  ( 2 )
-    ) i_stream_demux_spm_bypass (
-      .inp_valid_i ( refill_rsp_valid  ),
-      .inp_ready_o ( refill_rsp_ready  ),
-
-      .oup_sel_i   ( refill_rsp.bypass ),
-
-      .oup_valid_o ( {bypass_rsp_valid, prefetch_lookup_rsp_valid} ),
-      .oup_ready_i ( {bypass_rsp_ready, prefetch_lookup_rsp_ready} )
-    );
-
-    // Route responses - restore full ID for SPM responses
-    assign prefetch_lookup_rsp.data  = refill_rsp.data;
-    assign prefetch_lookup_rsp.error = refill_rsp.error;
-    assign prefetch_lookup_rsp.id    = spm_id_valid ? spm_id_q : '0;
-    assign bypass_rsp = refill_rsp;
-
-    // Tie off events and flush
-    assign icache_l1_events_o = '0;
-    logic flush_valid;
-    assign flush_valid = |flush_valid_i;
-    assign flush_ready_o = {CFG.NR_FETCH_PORTS{flush_valid}}; // Immediate ack
-
-  end else begin : gen_l1_mode
-    // L1 cache mode: Full lookup, handler, and refill logic
-
-  /// Tag lookup
-
-  // The lookup module contains the actual cache RAMs and performs lookups.
-  logic [CFG.FETCH_AW-1:0]    lookup_addr  ;
-  logic [CFG.ID_WIDTH-1:0]    lookup_id    ;
-  logic [CFG.SET_ALIGN-1:0]   lookup_set   ;
-  logic                       lookup_hit   ;
-  logic [CFG.LINE_WIDTH-1:0]  lookup_data  ;
-  logic                       lookup_error ;
-  logic                       lookup_valid ;
-  logic                       lookup_ready ;
-
-  logic [CFG.COUNT_ALIGN-1:0] write_addr  ;
-  logic [CFG.SET_ALIGN-1:0]   write_set   ;
-  logic [CFG.LINE_WIDTH-1:0]  write_data  ;
-  logic [CFG.TAG_WIDTH-1:0]   write_tag   ;
-  logic                       write_error ;
-  logic                       write_valid ;
-  logic                       write_ready ;
-
-  logic flush_valid, flush_ready;
-  logic flush_valid_lookup, flush_ready_lookup;
-
-  assign flush_ready_o = {CFG.NR_FETCH_PORTS{flush_ready}};
-  assign flush_valid = |flush_valid_i;
-
-  // We need to propagate the handshake into the other
-  // clock domain in case we operate w/ different clocks.
-  if (ISO_CROSSING) begin : gen_flush_crossing
-    isochronous_spill_register
-    i_isochronous_4phase_handshake (
-      .src_clk_i   ( clk_d2_i           ),
-      .src_rst_ni  ( rst_ni             ),
-      .src_valid_i ( flush_valid        ),
-      .src_ready_o ( flush_ready        ),
-      .src_data_i  ( '0                 ),
-      .dst_clk_i   ( clk_i              ),
-      .dst_rst_ni  ( rst_ni             ),
-      .dst_valid_o ( flush_valid_lookup ),
-      .dst_ready_i ( flush_ready_lookup ),
-      .dst_data_o  ( /* Unused */       )
-    );
-  end else begin : gen_no_flush_crossing
-    assign flush_valid_lookup = flush_valid;
-    assign flush_ready = flush_ready_lookup;
-  end
-
-  if (SERIAL_LOOKUP) begin : gen_serial_lookup
-    snitch_icache_lookup_serial #(
-      .CFG             ( CFG             ),
-      .sram_cfg_tag_t  ( sram_cfg_tag_t  ),
-      .sram_cfg_data_t ( sram_cfg_data_t )
-    ) i_lookup (
-      .clk_i,
-      .rst_ni,
-
-      .flush_valid_i   ( flush_valid_lookup        ),
-      .flush_ready_o   ( flush_ready_lookup        ),
-      .icache_events_o ( icache_l1_events_o        ),
-
-      .in_addr_i       ( prefetch_lookup_req.addr  ),
-      .in_id_i         ( prefetch_lookup_req.id    ),
-      .in_valid_i      ( prefetch_lookup_req_valid ),
-      .in_ready_o      ( prefetch_lookup_req_ready ),
-
-      .out_addr_o      ( lookup_addr               ),
-      .out_id_o        ( lookup_id                 ),
-      .out_set_o       ( lookup_set                ),
-      .out_hit_o       ( lookup_hit                ),
-      .out_data_o      ( lookup_data               ),
-      .out_error_o     ( lookup_error              ),
-      .out_valid_o     ( lookup_valid              ),
-      .out_ready_i     ( lookup_ready              ),
-
-      .write_addr_i    ( write_addr                ),
-      .write_set_i     ( write_set                 ),
-      .write_data_i    ( write_data                ),
-      .write_tag_i     ( write_tag                 ),
-      .write_error_i   ( write_error               ),
-      .write_valid_i   ( write_valid               ),
-      .write_ready_o   ( write_ready               ),
-
-      .sram_cfg_tag_i,
-      .sram_cfg_data_i
-    );
-
-  end else begin : gen_parallel_lookup
-    snitch_icache_lookup_parallel #(
-      .CFG             ( CFG             ),
-      .sram_cfg_tag_t  ( sram_cfg_tag_t  ),
-      .sram_cfg_data_t ( sram_cfg_data_t )
-    ) i_lookup (
-      .clk_i,
-      .rst_ni,
-
-      .flush_valid_i   ( flush_valid_lookup        ),
-      .flush_ready_o   ( flush_ready_lookup        ),
-      .icache_events_o ( icache_l1_events_o        ),
-
-      .in_addr_i       ( prefetch_lookup_req.addr  ),
-      .in_id_i         ( prefetch_lookup_req.id    ),
-      .in_valid_i      ( prefetch_lookup_req_valid ),
-      .in_ready_o      ( prefetch_lookup_req_ready ),
-
-      .out_addr_o      ( lookup_addr               ),
-      .out_id_o        ( lookup_id                 ),
-      .out_set_o       ( lookup_set                ),
-      .out_hit_o       ( lookup_hit                ),
-      .out_data_o      ( lookup_data               ),
-      .out_error_o     ( lookup_error              ),
-      .out_valid_o     ( lookup_valid              ),
-      .out_ready_i     ( lookup_ready              ),
-
-      .write_addr_i    ( write_addr                ),
-      .write_set_i     ( write_set                 ),
-      .write_data_i    ( write_data                ),
-      .write_tag_i     ( write_tag                 ),
-      .write_error_i   ( write_error               ),
-      .write_valid_i   ( write_valid               ),
-      .write_ready_o   ( write_ready               ),
-
-      .sram_cfg_tag_i,
-      .sram_cfg_data_i
-    );
-  end
-
-  // The miss handler module deals with the result of the lookup. It also
-  // keeps track of the pending refills and ensures that no redundant memory
-  // requests are made. Upon refill completion, it sends a new tag/data item
-  // to the lookup module and the received data to the prefetch module.
-  snitch_icache_handler #(CFG) i_handler (
-    .clk_i,
-    .rst_ni,
-
-    .in_req_addr_i   ( lookup_addr        ),
-    .in_req_id_i     ( lookup_id          ),
-    .in_req_set_i    ( lookup_set         ),
-    .in_req_hit_i    ( lookup_hit         ),
-    .in_req_data_i   ( lookup_data        ),
-    .in_req_error_i  ( lookup_error       ),
-    .in_req_valid_i  ( lookup_valid       ),
-    .in_req_ready_o  ( lookup_ready       ),
-
-    .in_rsp_data_o   ( prefetch_lookup_rsp.data  ),
-    .in_rsp_error_o  ( prefetch_lookup_rsp.error ),
-    .in_rsp_id_o     ( prefetch_lookup_rsp.id    ),
-    .in_rsp_valid_o  ( prefetch_lookup_rsp_valid ),
-    .in_rsp_ready_i  ( prefetch_lookup_rsp_ready ),
-
-    .write_addr_o    ( write_addr         ),
-    .write_set_o     ( write_set          ),
-    .write_data_o    ( write_data         ),
-    .write_tag_o     ( write_tag          ),
-    .write_error_o   ( write_error        ),
-    .write_valid_o   ( write_valid        ),
-    .write_ready_i   ( write_ready        ),
-
-    .out_req_addr_o  ( handler_req.addr    ),
-    .out_req_id_o    ( handler_req.id      ),
-    .out_req_valid_o ( handler_req_valid   ),
-    .out_req_ready_i ( handler_req_ready   ),
-
-    .out_rsp_data_i  ( handler_rsp.data    ),
-    .out_rsp_error_i ( handler_rsp.error   ),
-    .out_rsp_id_i    ( handler_rsp.id      ),
-    .out_rsp_valid_i ( handler_rsp_valid   ),
-    .out_rsp_ready_o ( handler_rsp_ready   )
-  );
-  assign handler_req.bypass = 1'b0;
-  // Arbitrate between bypass and cache-refills
-  stream_arbiter #(
-    .DATA_T ( miss_refill_req_t ),
-    .N_INP  ( 2                 )
-  ) i_stream_arbiter_miss_refill (
-    .clk_i,
-    .rst_ni,
-    .inp_data_i  ( {bypass_req_q, handler_req}             ),
-    .inp_valid_i ( {bypass_req_valid_q, handler_req_valid} ),
-    .inp_ready_o ( {bypass_req_ready_q, handler_req_ready} ),
-    .oup_data_o  ( refill_req                              ),
-    .oup_valid_o ( refill_req_valid                        ),
-    .oup_ready_i ( refill_req_ready                        )
-  );
-  // Response path muxing
-  stream_demux #(
-    .N_OUP  ( 2                 )
-  ) i_stream_demux_miss_refill (
-    .inp_valid_i ( refill_rsp_valid  ),
-    .inp_ready_o ( refill_rsp_ready  ),
-
-    .oup_sel_i   ( refill_rsp.bypass ),
-
-    .oup_valid_o ( {{bypass_rsp_valid, handler_rsp_valid}} ),
-    .oup_ready_i ( {{bypass_rsp_ready, handler_rsp_ready}} )
-  );
-
-  assign handler_rsp = refill_rsp;
-  assign bypass_rsp = refill_rsp;
-
-  // Instantiate the cache refill module which emits AXI transactions.
-  snitch_icache_refill #(
-    .CFG(CFG),
-    .axi_req_t (axi_req_t),
-    .axi_rsp_t (axi_rsp_t)
-  ) i_refill (
-    .clk_i,
-    .rst_ni,
-
-    .in_req_addr_i   ( refill_req.addr    ),
-    .in_req_id_i     ( refill_req.id      ),
-    .in_req_bypass_i ( refill_req.bypass  ),
-    .in_req_valid_i  ( refill_req_valid   ),
-    .in_req_ready_o  ( refill_req_ready   ),
-
-    .in_rsp_data_o   ( refill_rsp.data    ),
-    .in_rsp_error_o  ( refill_rsp.error   ),
-    .in_rsp_id_o     ( refill_rsp.id      ),
-    .in_rsp_bypass_o ( refill_rsp.bypass  ),
-    .in_rsp_valid_o  ( refill_rsp_valid   ),
-    .in_rsp_ready_i  ( refill_rsp_ready   ),
-    .axi_req_o (axi_req_o),
-    .axi_rsp_i (axi_rsp_i)
-  );
 
   end // gen_l1_mode
 
