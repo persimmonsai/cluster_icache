@@ -28,6 +28,8 @@ module snitch_icache import snitch_icache_pkg::*; #(
   parameter int unsigned FILL_DW = -1,
   /// Instruction SPM size in kB. If > 0, bypasses L1 entirely
   parameter int unsigned InstrSpmSize = 0,
+  /// Instruction SPM base address in memory map
+  parameter logic [FETCH_AW-1:0] InstrSpmBaseAddr = '0,
   /// Allow fetches to have priority over prefetches for L0 to L1
   parameter bit FETCH_PRIORITY = 1'b0,
   /// Merge L0-L1 fetches if requesting the same address
@@ -57,7 +59,9 @@ module snitch_icache import snitch_icache_pkg::*; #(
   parameter type sram_cfg_tag_t   = logic,
 
   parameter type axi_req_t = logic,
-  parameter type axi_rsp_t = logic
+  parameter type axi_rsp_t = logic,
+  parameter type spm_axi_req_t = logic,
+  parameter type spm_axi_rsp_t = logic
 ) (
   input  logic clk_i,
   input  logic clk_d2_i,
@@ -85,8 +89,8 @@ module snitch_icache import snitch_icache_pkg::*; #(
   input  axi_rsp_t axi_rsp_i,
   
   // AXI slave interface for SPM refill (only used when InstrSpmSize > 0)
-  input  axi_req_t spm_axi_req_i,
-  output axi_rsp_t spm_axi_rsp_o
+  input  spm_axi_req_t spm_axi_req_i,
+  output spm_axi_rsp_t spm_axi_rsp_o
 );
 
   // Bundle the parameters up into a proper configuration struct that we can
@@ -237,6 +241,7 @@ module snitch_icache import snitch_icache_pkg::*; #(
       | (~{($bits(in_cache_data[i])+1){inst_cacheable_i[i]}}
           & {in_bypass_error[i], in_bypass_data[i]});
 
+    // L0 cache always instantiated (same-cycle fetch path)
     snitch_icache_l0 #(
       .CFG   ( CFG ),
       .L0_ID (  i  )
@@ -358,178 +363,57 @@ module snitch_icache import snitch_icache_pkg::*; #(
   logic [NR_FETCH_PORTS-1:0] prefetch_req_ready_tmp;
   prefetch_req_t prefetch_lookup_req_tmp;
 
-  /// Arbitrate cache port
-  // 1. Request Side
-  if (FETCH_PRIORITY) begin : gen_fetch_priority
-
-    logic [NR_FETCH_PORTS-1:0] prefetch_req_priority;
-    logic [NR_FETCH_PORTS-1:0] prefetch_req_ready_pre, prefetch_req_ready_fetch;
-    prefetch_req_t             prefetch_lookup_req_pre, prefetch_lookup_req_fetch;
-    logic                      prefetch_lookup_req_valid_pre, prefetch_lookup_req_valid_fetch;
-    logic                      lock_pre_d, lock_pre_q;
-    logic                      prefetch_filtered_ready, fetch_filtered_ready;
-
-
-    for (genvar i = 0; i < NR_FETCH_PORTS; i++) begin : gen_prio
-      // prioritize fetches over prefetches
-      assign prefetch_req_priority[i] = prefetch_req[i].id[2*i];
-
-      assign prefetch_req_ready_tmp[i] = prefetch_req_priority[i] ? prefetch_req_ready_fetch[i] :
-                                                                    prefetch_req_ready_pre[i];
-    end
-
-    assign prefetch_lookup_req_valid = prefetch_lookup_req_valid_pre |
-                                       prefetch_lookup_req_valid_fetch;
-    assign prefetch_lookup_req_tmp = prefetch_lookup_req_valid_fetch && !lock_pre_q ?
-                                     prefetch_lookup_req_fetch :
-                                     prefetch_lookup_req_pre;
-
-    assign lock_pre_d = (lock_pre_q |
-                         (~prefetch_lookup_req_valid_fetch &
-                          prefetch_lookup_req_valid_pre     )) &
-                        ~prefetch_lookup_req_ready;
-
-    // Suppress ready if fetch is valid and if the prefetcher is not locked
-    // If merge fetches, still give ready if addresses match
-    assign prefetch_filtered_ready = (prefetch_lookup_req_valid_fetch && !lock_pre_q) &&
-                                  !(MERGE_FETCHES &&
-                                    prefetch_lookup_req_pre.addr == prefetch_lookup_req_fetch.addr)
-                                  ? 1'b0 : prefetch_lookup_req_ready;
-
-    // Suppress ready if locked to prefetcher
-    // If merge fetches, still give ready if addresses match
-    assign fetch_filtered_ready = lock_pre_q &&
-                                  !(MERGE_FETCHES &&
-                                    prefetch_lookup_req_pre.addr == prefetch_lookup_req_fetch.addr)
-                                  ? 1'b0 : prefetch_lookup_req_ready;
-
-    // prefetch arbiter - low priority
-    multi_accept_rr_arb #(
-      .data_t ( prefetch_req_t ),
-      .NumInp ( NR_FETCH_PORTS )
-    ) i_stream_arbiter_pre (
-      .clk_i,
-      .rst_ni,
-      .flush_i     ( '0 ),
-      .inp_data_i  ( prefetch_req                  ),
-      .inp_valid_i ( prefetch_req_valid & ~prefetch_req_priority ),
-      .inp_ready_o ( prefetch_req_ready_pre        ),
-      .oup_data_o  ( prefetch_lookup_req_pre       ),
-      .oup_valid_o ( prefetch_lookup_req_valid_pre ),
-      .oup_ready_i ( prefetch_filtered_ready       )
-    );
-
-    // fetch arbiter - high priority
-    multi_accept_rr_arb #(
-      .data_t ( prefetch_req_t ),
-      .NumInp ( NR_FETCH_PORTS )
-    ) i_stream_arbiter_fetch (
-      .clk_i,
-      .rst_ni,
-      .flush_i     ( '0 ),
-      .inp_data_i  ( prefetch_req                    ),
-      .inp_valid_i ( prefetch_req_valid & prefetch_req_priority ),
-      .inp_ready_o ( prefetch_req_ready_fetch        ),
-      .oup_data_o  ( prefetch_lookup_req_fetch       ),
-      .oup_valid_o ( prefetch_lookup_req_valid_fetch ),
-      .oup_ready_i ( fetch_filtered_ready            )
-    );
-
-    `FF(lock_pre_q, lock_pre_d, '0)
-
-  end else begin : gen_standard_fetch
-
-    multi_accept_rr_arb #(
-      .data_t ( prefetch_req_t ),
-      .NumInp ( NR_FETCH_PORTS )
-    ) i_stream_arbiter (
-      .clk_i,
-      .rst_ni,
-      .flush_i     ( '0 ),
-      .inp_data_i  ( prefetch_req              ),
-      .inp_valid_i ( prefetch_req_valid        ),
-      .inp_ready_o ( prefetch_req_ready_tmp    ),
-      .oup_data_o  ( prefetch_lookup_req_tmp   ),
-      .oup_valid_o ( prefetch_lookup_req_valid ),
-      .oup_ready_i ( prefetch_lookup_req_ready )
-    );
-
-  end
-
-  if (MERGE_FETCHES) begin : gen_merge_fetches
-    for (genvar i = 0; i < NR_FETCH_PORTS; i++) begin : gen_prefetch_req_ready
-      assign prefetch_req_ready[i] = prefetch_req_ready_tmp[i] |
-                                     (prefetch_lookup_req_ready &
-                                      prefetch_req[i].addr == prefetch_lookup_req.addr);
-    end
-
-    always_comb begin
-      prefetch_lookup_req = prefetch_lookup_req_tmp;
-      for (int i = 0; i < NR_FETCH_PORTS; i++) begin
-        prefetch_lookup_req.id |= prefetch_req_ready[i] && prefetch_req_valid[i] ?
-                                  prefetch_req[i].id : '0;
-      end
-    end
-  end else begin : gen_no_merge_fetches
-    assign prefetch_req_ready = prefetch_req_ready_tmp;
-    assign prefetch_lookup_req = prefetch_lookup_req_tmp;
-  end
-
-  // 2. Response Side
-  // This breaks if the pre-fetcher would not alway be ready
-  // which is the case for the moment
-  for (genvar i = 0; i < NR_FETCH_PORTS; i++) begin : gen_resp
-    assign prefetch_rsp[i] = prefetch_lookup_rsp;
-    // check if one of the ID bits is set
-    assign prefetch_rsp_valid[i] =
-        ((|((prefetch_rsp[i].id >> 2*i) & 2'b11)) & prefetch_lookup_rsp_valid);
-  end
-  assign prefetch_lookup_rsp_ready = |prefetch_rsp_ready;
-
   // ==============================================
   // L0 Prefetcher Backend: SPM mode vs L1 mode
   // ==============================================
 
   if (InstrSpmSize > 0) begin : gen_spm_mode
-    // SPM mode: prefetch_lookup_req (cacheable) goes to SPM
+    // SPM mode: Direct parallel access from all fetch ports
+    // Bypass arbitration - each port connects directly to SPM
     // bypass_req_q (non-cacheable) goes to AXI for bootrom
-    // No address decoding needed - inst_cacheable_i already separates them
 
-    // Instantiate multi-port instruction SPM
     localparam int unsigned InstrSpmNumBanks = 2**$clog2(NR_FETCH_PORTS);
     
-    logic spm_rvalid;
+    logic [NR_FETCH_PORTS-1:0] spm_rvalid;
+    logic [NR_FETCH_PORTS-1:0][CFG.LINE_WIDTH-1:0] spm_rdata;
+    logic [NR_FETCH_PORTS-1:0][CFG.FETCH_AW-1:0] fetch_addr;
+    
+    // Extract addresses from prefetch requests
+    for (genvar i = 0; i < NR_FETCH_PORTS; i++) begin : gen_addr_extract
+      assign fetch_addr[i] = prefetch_req[i].addr;
+    end
     
     snitch_instr_spm #(
       .AddrWidth (CFG.FETCH_AW),
       .DataWidth (CFG.FILL_DW),
-      .IdWidth (4), // Refill ID width
+      .IdWidth (4),
       .SpmSize (InstrSpmSize * 1024),
+      .SpmBaseAddr (InstrSpmBaseAddr),
       .NumBanks (InstrSpmNumBanks),
-      .NumFetchPorts (1), // Single arbitrated fetch port
-      .axi_req_t (axi_req_t),
-      .axi_rsp_t (axi_rsp_t)
+      .NumFetchPorts (NR_FETCH_PORTS),
+      .axi_req_t (spm_axi_req_t),
+      .axi_rsp_t (spm_axi_rsp_t)
     ) i_instr_spm (
-      .clk_i (clk_i),
-      .rst_ni (rst_ni),
-      // Arbitrated cacheable requests go to SPM
-      .fetch_req_i (prefetch_lookup_req_valid),
-      .fetch_addr_i (prefetch_lookup_req.addr),
-      .fetch_rdata_o (prefetch_lookup_rsp.data),
+      .clk_i,
+      .rst_ni,
+      .fetch_req_i (prefetch_req_valid),
+      .fetch_addr_i (fetch_addr),
+      .fetch_rdata_o (spm_rdata),
       .fetch_rvalid_o (spm_rvalid),
-      // AXI slave for refill (exposed at icache level)
       .axi_req_i (spm_axi_req_i),
       .axi_rsp_o (spm_axi_rsp_o)
     );
     
-    // SPM response - always ready (single-cycle)
-    assign prefetch_lookup_req_ready = 1'b1;
-    assign prefetch_lookup_rsp_valid = spm_rvalid;
-    assign prefetch_lookup_rsp.error = 1'b0; // SPM never errors
-    assign prefetch_lookup_rsp.id = prefetch_lookup_req.id;
+    // Connect SPM responses directly (no arbitration)
+    for (genvar i = 0; i < NR_FETCH_PORTS; i++) begin : gen_spm_resp
+      // SPM responses are always ready (parallel multi-port memory)
+      assign prefetch_req_ready[i] = 1'b1;
+      assign prefetch_rsp[i].data = spm_rdata[i];
+      assign prefetch_rsp[i].error = 1'b0;
+      assign prefetch_rsp[i].id = prefetch_req[i].id;
+      assign prefetch_rsp_valid[i] = spm_rvalid[i];
+    end
 
-    // Use refill module for bypass (bootrom) accesses via AXI
-    // bypass_req_q comes from l0_to_bypass for non-cacheable requests
     snitch_icache_refill #(
       .CFG       ( CFG       ),
       .axi_req_t ( axi_req_t ),
@@ -537,39 +421,166 @@ module snitch_icache import snitch_icache_pkg::*; #(
     ) i_refill (
       .clk_i,
       .rst_ni,
-
       .in_req_addr_i   ( bypass_req_q.addr    ),
       .in_req_id_i     ( bypass_req_q.id      ),
       .in_req_bypass_i ( bypass_req_q.bypass  ),
       .in_req_valid_i  ( bypass_req_valid_q   ),
       .in_req_ready_o  ( bypass_req_ready_q   ),
-
       .in_rsp_data_o   ( bypass_rsp.data      ),
       .in_rsp_error_o  ( bypass_rsp.error     ),
       .in_rsp_id_o     ( bypass_rsp.id        ),
       .in_rsp_bypass_o ( bypass_rsp.bypass    ),
       .in_rsp_valid_o  ( bypass_rsp_valid     ),
       .in_rsp_ready_i  ( bypass_rsp_ready     ),
-
       .axi_req_o       ( axi_req_o            ),
       .axi_rsp_i       ( axi_rsp_i            )
     );
 
-    // Tie off events and flush
+    assign prefetch_lookup_req_ready = 1'b0;
+    assign prefetch_lookup_rsp_valid = 1'b0;
+    assign prefetch_lookup_rsp = '0;
     assign icache_l1_events_o = '0;
     logic flush_valid;
     assign flush_valid = |flush_valid_i;
-    assign flush_ready_o = {CFG.NR_FETCH_PORTS{flush_valid}}; // Immediate ack
+    assign flush_ready_o = {CFG.NR_FETCH_PORTS{flush_valid}};
 
   end else begin : gen_l1_mode
-    // L1 cache mode: Full lookup, handler, and refill logic
+    // L1 Cache Mode: Arbiter merges fetch ports into single lookup port
     
     // Tie off SPM AXI slave interface (not used in L1 mode)
     assign spm_axi_rsp_o = '0;
 
-    /// Tag lookup
+    // ===== Request-side arbitration for L1 lookup =====
 
-    // The lookup module contains the actual cache RAMs and performs lookups.
+    /// Arbitrate cache port
+    // 1. Request Side
+    if (FETCH_PRIORITY) begin : gen_fetch_priority
+
+      logic [NR_FETCH_PORTS-1:0] prefetch_req_priority;
+      logic [NR_FETCH_PORTS-1:0] prefetch_req_ready_pre, prefetch_req_ready_fetch;
+      prefetch_req_t             prefetch_lookup_req_pre, prefetch_lookup_req_fetch;
+      logic                      prefetch_lookup_req_valid_pre, prefetch_lookup_req_valid_fetch;
+      logic                      lock_pre_d, lock_pre_q;
+      logic                      prefetch_filtered_ready, fetch_filtered_ready;
+
+
+      for (genvar i = 0; i < NR_FETCH_PORTS; i++) begin : gen_prio
+        // prioritize fetches over prefetches
+        assign prefetch_req_priority[i] = prefetch_req[i].id[2*i];
+
+        assign prefetch_req_ready_tmp[i] = prefetch_req_priority[i] ? prefetch_req_ready_fetch[i] :
+                                                                      prefetch_req_ready_pre[i];
+      end
+
+      assign prefetch_lookup_req_valid = prefetch_lookup_req_valid_pre |
+                                         prefetch_lookup_req_valid_fetch;
+      assign prefetch_lookup_req_tmp = prefetch_lookup_req_valid_fetch && !lock_pre_q ?
+                                       prefetch_lookup_req_fetch :
+                                       prefetch_lookup_req_pre;
+
+      assign lock_pre_d = (lock_pre_q |
+                           (~prefetch_lookup_req_valid_fetch &
+                            prefetch_lookup_req_valid_pre     )) &
+                          ~prefetch_lookup_req_ready;
+
+      // Suppress ready if fetch is valid and if the prefetcher is not locked
+      // If merge fetches, still give ready if addresses match
+      assign prefetch_filtered_ready = (prefetch_lookup_req_valid_fetch && !lock_pre_q) &&
+                                    !(MERGE_FETCHES &&
+                                      prefetch_lookup_req_pre.addr == prefetch_lookup_req_fetch.addr)
+                                    ? 1'b0 : prefetch_lookup_req_ready;
+
+      // Suppress ready if locked to prefetcher
+      // If merge fetches, still give ready if addresses match
+      assign fetch_filtered_ready = lock_pre_q &&
+                                    !(MERGE_FETCHES &&
+                                      prefetch_lookup_req_pre.addr == prefetch_lookup_req_fetch.addr)
+                                    ? 1'b0 : prefetch_lookup_req_ready;
+
+      // prefetch arbiter - low priority
+      multi_accept_rr_arb #(
+        .data_t ( prefetch_req_t ),
+        .NumInp ( NR_FETCH_PORTS )
+      ) i_stream_arbiter_pre (
+        .clk_i,
+        .rst_ni,
+        .flush_i     ( '0 ),
+        .inp_data_i  ( prefetch_req                  ),
+        .inp_valid_i ( prefetch_req_valid & ~prefetch_req_priority ),
+        .inp_ready_o ( prefetch_req_ready_pre        ),
+        .oup_data_o  ( prefetch_lookup_req_pre       ),
+        .oup_valid_o ( prefetch_lookup_req_valid_pre ),
+        .oup_ready_i ( prefetch_filtered_ready       )
+      );
+
+      // fetch arbiter - high priority
+      multi_accept_rr_arb #(
+        .data_t ( prefetch_req_t ),
+        .NumInp ( NR_FETCH_PORTS )
+      ) i_stream_arbiter_fetch (
+        .clk_i,
+        .rst_ni,
+        .flush_i     ( '0 ),
+        .inp_data_i  ( prefetch_req                    ),
+        .inp_valid_i ( prefetch_req_valid & prefetch_req_priority ),
+        .inp_ready_o ( prefetch_req_ready_fetch        ),
+        .oup_data_o  ( prefetch_lookup_req_fetch       ),
+        .oup_valid_o ( prefetch_lookup_req_valid_fetch ),
+        .oup_ready_i ( fetch_filtered_ready            )
+      );
+
+      `FF(lock_pre_q, lock_pre_d, '0)
+
+    end else begin : gen_standard_fetch
+
+      multi_accept_rr_arb #(
+        .data_t ( prefetch_req_t ),
+        .NumInp ( NR_FETCH_PORTS )
+      ) i_stream_arbiter (
+        .clk_i,
+        .rst_ni,
+        .flush_i     ( '0 ),
+        .inp_data_i  ( prefetch_req              ),
+        .inp_valid_i ( prefetch_req_valid        ),
+        .inp_ready_o ( prefetch_req_ready_tmp    ),
+        .oup_data_o  ( prefetch_lookup_req_tmp   ),
+        .oup_valid_o ( prefetch_lookup_req_valid ),
+        .oup_ready_i ( prefetch_lookup_req_ready )
+      );
+
+    end
+
+    if (MERGE_FETCHES) begin : gen_merge_fetches
+      for (genvar i = 0; i < NR_FETCH_PORTS; i++) begin : gen_prefetch_req_ready
+        assign prefetch_req_ready[i] = prefetch_req_ready_tmp[i] |
+                                       (prefetch_lookup_req_ready &
+                                        prefetch_req[i].addr == prefetch_lookup_req.addr);
+      end
+
+      always_comb begin
+        prefetch_lookup_req = prefetch_lookup_req_tmp;
+        for (int i = 0; i < NR_FETCH_PORTS; i++) begin
+          prefetch_lookup_req.id |= prefetch_req_ready[i] && prefetch_req_valid[i] ?
+                                    prefetch_req[i].id : '0;
+        end
+      end
+    end else begin : gen_no_merge_fetches
+      assign prefetch_req_ready = prefetch_req_ready_tmp;
+      assign prefetch_lookup_req = prefetch_lookup_req_tmp;
+    end
+
+    // 2. Response Side
+    // This breaks if the pre-fetcher would not alway be ready
+    // which is the case for the moment
+    for (genvar i = 0; i < NR_FETCH_PORTS; i++) begin : gen_resp
+      assign prefetch_rsp[i] = prefetch_lookup_rsp;
+      // check if one of the ID bits is set
+      assign prefetch_rsp_valid[i] =
+          ((|((prefetch_rsp[i].id >> 2*i) & 2'b11)) & prefetch_lookup_rsp_valid);
+    end
+    assign prefetch_lookup_rsp_ready = |prefetch_rsp_ready;
+
+    // ===== Tag lookup =====
     logic [CFG.FETCH_AW-1:0]    lookup_addr  ;
     logic [CFG.ID_WIDTH-1:0]    lookup_id    ;
     logic [CFG.SET_ALIGN-1:0]   lookup_set   ;
