@@ -65,10 +65,13 @@ module multi_accept_rr_arb #(
   ))
   else $fatal(1, "Lock implies same arbiter decision in next cycle if output is not ready.");
 
+
+  // Trigger this *with* lock_q antecedant to avoid event queue scheduling issues
+  // over `posedge clk_i`.
   lock_req :
   assume property(
       @(posedge clk_i) disable iff (!rst_ni || flush_i)
-          lock_d |=> inp_valid_i[idx] == req_q[idx])
+          lock_q |-> inp_valid_i[idx] == req_q[idx])
   else $fatal(1, "It is disallowed to deassert the selected unserved request signals.");
 `endif
 `endif
