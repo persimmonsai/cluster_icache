@@ -766,6 +766,12 @@ module l0_to_bypass #(
     PresentResponse
   } state_e;
   state_e [CFG.NR_FETCH_PORTS-1:0] state_d, state_q;
+  // Line each port requested. The fetch address may move while a bypass
+  // fetch is outstanding (Sv32: an ITLB refill replaces the physical page
+  // under a held fetch; a trap or mret switches translation): a response is
+  // only presented while the port still asks for that line, otherwise it is
+  // dropped and the port requests again.
+  logic [CFG.NR_FETCH_PORTS-1:0][CFG.FETCH_AW-1:0] req_addr_q;
 
   // Mask address so that it is aligned to the cache-line width.
   logic [CFG.NR_FETCH_PORTS-1:0][CFG.FETCH_AW-1:0] in_addr_masked;
@@ -859,10 +865,11 @@ module l0_to_bypass #(
             state_d[i]      = PresentResponse;
           end
         end
-        // The response will be served from the register and is valid for one cycle.
+        // The response will be served from the register and is valid for one cycle,
+        // if the port still fetches from the requested line.
         PresentResponse: begin
           state_d[i]    = Idle;
-          in_ready_o[i] = 1'b1;
+          in_ready_o[i] = in_addr_masked[i] == req_addr_q[i];
         end
         default: ;
       endcase
@@ -872,6 +879,7 @@ module l0_to_bypass #(
         (in_addr_i[i][snitch_icache_pkg::minwidth(CFG.LINE_ALIGN,3)-1:CFG.FETCH_ALIGN] * CFG.FETCH_DW));
     `FFL({in_data_o[i], in_error_o[i]}, {fill_rsp_data[CFG.FETCH_DW-1:0], refill_rsp_error_i},
          rsp_valid[i], '0, clk_i, rst_ni)
+    `FFL(req_addr_q[i], in_addr_masked[i], in_valid[i] & in_ready[i], '0, clk_i, rst_ni)
   end
 
   `FF(state_q, state_d, '{default: Idle})
